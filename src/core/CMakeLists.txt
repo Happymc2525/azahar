@@ -200,6 +200,10 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/romfs.cpp
     hle/romfs.h
     hle/service/ac/ac.cpp
+    hle/service/ac/ap_list.cpp
+    hle/service/ac/ap_list.h
+    hle/service/ac/host_wifi.cpp
+    hle/service/ac/host_wifi.h
     hle/service/ac/ac.h
     hle/service/ac/ac_i.cpp
     hle/service/ac/ac_i.h
@@ -505,6 +509,9 @@ endif()
 create_target_directory_groups(citra_core)
 
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)
+if (WIN32)
+    target_link_libraries(citra_core PRIVATE wlanapi)
+endif()
 target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)
 target_link_libraries(citra_core PUBLIC dds-ktx PRIVATE cryptopp fmt lodepng open_source_archives)
 
