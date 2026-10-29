@@ -43,6 +43,81 @@ import org.citra.citra_emu.viewmodel.CompressProgressDialogViewModel
  * with the native side of the Citra code.
  */
 object NativeLibrary {
+    private val wifiPermissionRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var lastWifiScanRequest = -31_000L
+
+    // Called from the core's IO worker. Permission prompts run on the UI thread without
+    // blocking emulation; retry Catch after granting permission. Records are 44 raw bytes.
+    @Keep
+    @JvmStatic
+    @Synchronized
+    @Suppress("DEPRECATION")
+    fun scanWifiAccessPoints(): ByteArray? {
+        val context = CitraApplication.appContext
+        if (ContextCompat.checkSelfPermission(context, permission.ACCESS_FINE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED) {
+            val activity = sEmulationActivity.get()
+            if (activity != null && wifiPermissionRequested.compareAndSet(false, true)) {
+                activity.runOnUiThread {
+                    activity.requestPermissions(arrayOf(permission.ACCESS_FINE_LOCATION,
+                        permission.ACCESS_COARSE_LOCATION), 0x5749)
+                }
+            }
+            Log.warning("Wi-Fi scan unavailable: grant precise location permission and retry Catch")
+            return null
+        }
+        val location = context.getSystemService(android.content.Context.LOCATION_SERVICE)
+            as android.location.LocationManager
+        if (!androidx.core.location.LocationManagerCompat.isLocationEnabled(location)) {
+            Log.warning("Wi-Fi scan unavailable: enable Android Location")
+            return null
+        }
+        val wifi = context.getSystemService(android.content.Context.WIFI_SERVICE)
+            as android.net.wifi.WifiManager
+        if (!wifi.isWifiEnabled) {
+            Log.warning("Wi-Fi scan unavailable: enable Wi-Fi")
+            return null
+        }
+        return try {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastWifiScanRequest >= 31_000L) {
+                lastWifiScanRequest = now
+                if (!wifi.startScan()) Log.warning("Wi-Fi scan throttled; using cached results")
+            }
+            // startScan is asynchronous. Use the newest OS cache; later calls see its update.
+            val records = wifi.scanResults.take(512).mapNotNull { ap ->
+                val frequency = ap.frequency
+                if (frequency !in 2412..2472 || (frequency - 2407) % 5 != 0) return@mapNotNull null
+                val parts = ap.BSSID?.split(":") ?: return@mapNotNull null
+                if (parts.size != 6 || parts.any { it.length != 2 }) return@mapNotNull null
+                val mac = parts.map { it.toIntOrNull(16) ?: return@mapNotNull null }
+                val ssid = (ap.SSID ?: "").toByteArray(Charsets.UTF_8).take(32).toByteArray()
+                val caps = ap.capabilities ?: ""
+                val secured = caps.contains("WEP") || caps.contains("PSK") ||
+                    caps.contains("EAP") || caps.contains("SAE") || caps.contains("OWE")
+                java.nio.ByteBuffer.allocate(44).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+                    put(ssid)
+                    position(32)
+                    mac.forEach { put(it.toByte()) }
+                    putShort(ap.level.coerceIn(-127, 0).toShort())
+                    put(((frequency - 2407) / 5).toByte())
+                    put(if (secured) 1.toByte() else 0.toByte())
+                    put(ssid.size.toByte())
+                    put(0.toByte())
+                }.array()
+            }
+            java.nio.ByteBuffer.allocate(records.size * 44).apply {
+                records.forEach { put(it) }
+            }.array()
+        } catch (error: SecurityException) {
+            Log.warning("Wi-Fi scan permission denied: ${error.message}")
+            null
+        } catch (error: RuntimeException) {
+            Log.warning("Wi-Fi scan unavailable: ${error.message}")
+            null
+        }
+    }
+
     /**
      * Default touchscreen device
      */
