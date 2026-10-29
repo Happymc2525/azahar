@@ -39,6 +39,7 @@
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/camera/factory.h"
 #include "core/hle/service/am/am.h"
+#include "core/hle/service/ac/ac.h"
 #include "core/hle/service/fs/archive.h"
 #include "core/hle/service/nfc/nfc.h"
 #include "core/hw/unique_data.h"
@@ -196,6 +197,52 @@ static bool CheckMicPermission() {
                                                                IDCache::GetRequestMicPermission());
 }
 
+static std::optional<std::vector<Service::AC::HostApInfo>> ScanAndroidWifi() {
+    JNIEnv* env = IDCache::GetEnvForThread();
+    const auto method = env->GetStaticMethodID(IDCache::GetNativeLibraryClass(),
+                                              "scanWifiAccessPoints", "()[B");
+    if (env->ExceptionCheck() || !method) {
+        env->ExceptionClear();
+        LOG_ERROR(Service_AC, "Android Wi-Fi bridge method unavailable");
+        return std::nullopt;
+    }
+    auto data = static_cast<jbyteArray>(env->CallStaticObjectMethod(
+        IDCache::GetNativeLibraryClass(), method));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        if (data) env->DeleteLocalRef(data);
+        LOG_WARNING(Service_AC, "Android Wi-Fi bridge failed");
+        return std::nullopt;
+    }
+    if (!data) return std::nullopt;
+    const auto length = env->GetArrayLength(data);
+    if (length % 44 != 0 || length > 512 * 44) {
+        env->DeleteLocalRef(data);
+        return std::nullopt;
+    }
+    std::vector<u8> bytes(length);
+    if (length) env->GetByteArrayRegion(data, 0, length, reinterpret_cast<jbyte*>(bytes.data()));
+    env->DeleteLocalRef(data);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return std::nullopt;
+    }
+    std::vector<Service::AC::HostApInfo> result;
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 44) {
+        const u8* entry = bytes.data() + offset;
+        Service::AC::HostApInfo info;
+        info.ssid.assign(reinterpret_cast<const char*>(entry), std::min<u8>(entry[42], 32));
+        std::copy_n(entry + 32, 6, info.bssid.begin());
+        const u16 raw_rssi = static_cast<u16>(entry[38] | (entry[39] << 8));
+        info.rssi = static_cast<s16>(raw_rssi < 0x8000 ? static_cast<int>(raw_rssi)
+                                                     : static_cast<int>(raw_rssi) - 65536);
+        info.channel = entry[40];
+        info.security = entry[41] ? Service::AC::ApSecurity::Secured : Service::AC::ApSecurity::Open;
+        result.push_back(std::move(info));
+    }
+    return result;
+}
+
 static Core::System::ResultStatus RunCitra(const std::string& filepath) {
     // Citra core only supports a single running instance
     std::scoped_lock lock(running_mutex);
@@ -311,6 +358,7 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
 
     // Register microphone permission check
     system.RegisterMicPermissionCheck(&CheckMicPermission);
+    Service::AC::RegisterHostWifiScanner(&ScanAndroidWifi);
 
     // No PICA debugging on Android
     if (Settings::values.pica_debugging) {
