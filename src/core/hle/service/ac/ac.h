@@ -5,7 +5,11 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <vector>
+#include "core/hle/service/ac/ap_list.h"
 #include "core/hle/service/service.h"
 
 namespace Core {
@@ -17,6 +21,10 @@ class Event;
 }
 
 namespace Service::AC {
+// nullopt means scanning was unavailable; an empty vector means no APs were found.
+using HostWifiScanner = std::function<std::optional<std::vector<HostApInfo>>()>;
+void RegisterHostWifiScanner(HostWifiScanner scanner);
+
 class Module final {
 public:
     explicit Module(Core::System& system_);
@@ -25,6 +33,8 @@ public:
     class Interface : public ServiceFramework<Interface> {
     public:
         Interface(std::shared_ptr<Module> ac, const char* name, u32 max_session);
+
+        void ScanAPs(Kernel::HLERequestContext& ctx);
 
         /**
          * AC::CreateDefaultConfig service function

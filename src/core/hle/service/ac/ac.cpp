@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstring>
+#include <exception>
+#include <mutex>
 #include <vector>
 #include "common/archives.h"
 #include "common/common_types.h"
@@ -18,6 +21,7 @@
 #include "core/hle/service/ac/ac.h"
 #include "core/hle/service/ac/ac_i.h"
 #include "core/hle/service/ac/ac_u.h"
+#include "core/hle/service/ac/host_wifi.h"
 #include "core/hle/service/soc/soc_u.h"
 #include "core/memory.h"
 
@@ -25,6 +29,67 @@ SERIALIZE_EXPORT_IMPL(Service::AC::Module)
 SERVICE_CONSTRUCT_IMPL(Service::AC::Module)
 
 namespace Service::AC {
+namespace {
+std::mutex scanner_mutex;
+HostWifiScanner host_scanner;
+}
+
+void RegisterHostWifiScanner(HostWifiScanner scanner) {
+    std::scoped_lock lock{scanner_mutex};
+    host_scanner = std::move(scanner);
+}
+
+void Module::Interface::ScanAPs(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const u32 size = rp.Pop<u32>();
+    rp.Skip(2, false); // Calling process ID.
+    const u16 command_id = static_cast<u16>(ctx.CommandHeader().command_id.Value());
+    // A static-buffer descriptor has an 18-bit size. Bound allocation before host IO.
+    if (size > 0x3FFFF) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+        rb.Push(Result(ErrorDescription::InvalidSize, ErrorModule::AC,
+                       ErrorSummary::InvalidArgument, ErrorLevel::Usage));
+        rb.Push<u32>(0);
+        return;
+    }
+    HostWifiScanner scanner;
+    {
+        std::scoped_lock lock{scanner_mutex};
+        scanner = host_scanner;
+    }
+    struct ScanState {
+        std::vector<ApInfo> entries;
+        bool available = false;
+    };
+    auto state = std::make_shared<ScanState>();
+    ctx.RunAsync(
+        [state, scanner, size](Kernel::HLERequestContext&) {
+            try {
+                auto found = scanner ? scanner() : ScanPlatformWifi();
+                state->available = found.has_value();
+                if (found) {
+                    state->entries = BuildApList(std::move(*found), size / sizeof(ApInfo));
+                }
+            } catch (const std::exception& error) {
+                LOG_ERROR(Service_AC, "Host Wi-Fi scan failed: {}", error.what());
+            }
+            return s64{3'210'000'000};
+        },
+        [state, size, command_id](Kernel::HLERequestContext& context) {
+            std::vector<u8> buffer(size, 0);
+            if (!state->entries.empty()) {
+                std::memcpy(buffer.data(), state->entries.data(),
+                            state->entries.size() * sizeof(ApInfo));
+            }
+            IPC::RequestBuilder rb(context, command_id, 2, 2);
+            rb.Push(ResultSuccess);
+            rb.Push<u32>(static_cast<u32>(state->entries.size()));
+            rb.PushStaticBuffer(std::move(buffer), 0);
+            LOG_INFO(Service_AC, "ScanAPs size=0x{:X}, host_available={}, access_points={}",
+                     size, state->available, state->entries.size());
+        });
+}
+
 void Module::Interface::CreateDefaultConfig(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
